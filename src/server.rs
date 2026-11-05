@@ -21,6 +21,7 @@ use crate::{
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State},
+    handler::Handler,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -852,10 +853,11 @@ pub fn build_app_with_wasm_middleware(
         ));
     }
 
-    let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
+    let concurrency_limit = axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::concurrency_limit_middleware,
-    ));
+    );
+    let protected_routes = protected_routes.route_layer(concurrency_limit.clone());
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -888,9 +890,11 @@ pub fn build_app_with_wasm_middleware(
         .merge(admin_routes)
         .merge(worker_routes);
 
-    // Choose fallback based on transparent proxy mode
+    // Choose fallback based on transparent proxy mode. `route_layer` does not wrap a
+    // fallback, so the proxy takes the limiter here: it sends work to a worker, and it
+    // must use the same pool as the protected routes.
     let base_app = if enable_transparent_proxy {
-        base_app.fallback(transparent_proxy_handler)
+        base_app.fallback(transparent_proxy_handler.layer(concurrency_limit))
     } else {
         base_app.fallback(sink_handler)
     };

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::classify::ServerErrorsFailureClass;
@@ -388,15 +389,6 @@ pub struct QueuedRequest {
     permit_tx: oneshot::Sender<Result<(), StatusCode>>,
 }
 
-/// Queue metrics for monitoring
-#[derive(Debug, Default)]
-pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
-}
-
 /// Queue processor that handles queued requests
 pub struct QueueProcessor {
     token_bucket: Arc<TokenBucket>,
@@ -490,19 +482,78 @@ impl ConcurrencyLimiter {
     }
 }
 
+/// Response header that names why the concurrency limiter rejected a request.
+pub const ADMISSION_REASON_HEADER: &str = "x-vllm-router-admission-reason";
+
+/// Why the concurrency limiter rejected a request.
+#[derive(Clone, Copy, Debug)]
+enum AdmissionRejection {
+    /// There is no capacity and queuing is disabled.
+    NoCapacity,
+    /// There is no capacity and the queue has no room.
+    QueueFull,
+    /// The request ran out of time in the queue.
+    QueueTimeout,
+    /// The queue stopped, so it cannot admit the request.
+    Closed,
+}
+
+impl AdmissionRejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCapacity => "no_capacity",
+            Self::QueueFull => "queue_full",
+            Self::QueueTimeout => "queue_timeout",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Count a limiter rejection and put its reason on `response`.
+fn reject(reason: AdmissionRejection, mut response: Response) -> Response {
+    let reason = reason.as_str();
+    RouterMetrics::record_admission_rejected(reason);
+    response
+        .headers_mut()
+        .insert(ADMISSION_REASON_HEADER, HeaderValue::from_static(reason));
+    response
+}
+
+/// One request in the limiter queue. The wait ends when this value drops, so a client
+/// that disconnects while it is queued does not stay in the gauge.
+struct AdmissionWait {
+    started_at: Instant,
+}
+
+impl AdmissionWait {
+    fn start() -> Self {
+        RouterMetrics::increment_admission_waiting();
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for AdmissionWait {
+    fn drop(&mut self) {
+        RouterMetrics::decrement_admission_waiting();
+        RouterMetrics::record_admission_wait(self.started_at.elapsed());
+    }
+}
+
 /// A 429 carrying a `Retry-After` hint.
 ///
 /// Without the header OpenAI-compatible SDKs treat the 429 as non-retryable and
 /// surface it to the caller instead of backing off, so a bare 429 turns a transient
 /// queue-full into a hard failure. The hint comes from the token bucket rather than a
 /// new knob; it is a lower bound, since a finishing request can free a slot sooner.
-async fn too_many_requests(token_bucket: &TokenBucket) -> Response {
+async fn too_many_requests(token_bucket: &TokenBucket, reason: AdmissionRejection) -> Response {
     let seconds = token_bucket.seconds_until_available(1.0).await.ceil() as u64;
     let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
-    response
+    reject(reason, response)
 }
 
 /// Middleware function for concurrency limiting with optional queuing
@@ -550,7 +601,11 @@ pub async fn concurrency_limit_middleware(
                     }
 
                     // Wait for token from queue processor
-                    match permit_rx.await {
+                    let wait = AdmissionWait::start();
+                    let permit = permit_rx.await;
+                    drop(wait);
+
+                    match permit {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
                             // Dequeue for embeddings
@@ -575,7 +630,8 @@ pub async fn concurrency_limit_middleware(
                                     EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
-                            status.into_response()
+                            // The queue processor only sends 408.
+                            reject(AdmissionRejection::QueueTimeout, status.into_response())
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
@@ -585,18 +641,25 @@ pub async fn concurrency_limit_middleware(
                                     EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            reject(
+                                AdmissionRejection::Closed,
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                            )
                         }
                     }
                 }
-                Err(_) => {
+                Err(TrySendError::Full(_)) => {
                     warn!("Request queue is full, returning 429");
-                    too_many_requests(&token_bucket).await
+                    too_many_requests(&token_bucket, AdmissionRejection::QueueFull).await
+                }
+                Err(TrySendError::Closed(_)) => {
+                    error!("Request queue is closed, returning 429");
+                    too_many_requests(&token_bucket, AdmissionRejection::Closed).await
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            too_many_requests(&token_bucket).await
+            too_many_requests(&token_bucket, AdmissionRejection::NoCapacity).await
         }
     }
 }

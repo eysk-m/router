@@ -3,6 +3,8 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+const ADMISSION_WAIT_SECONDS: &str = "vllm_router_admission_wait_seconds";
+
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
     pub port: u16,
@@ -267,6 +269,20 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_embeddings_queue_size", "Embedding queue size");
 
+    // Concurrency limiter admission metrics
+    describe_gauge!(
+        "vllm_router_admission_waiting",
+        "Number of requests waiting in the concurrency limiter queue"
+    );
+    describe_counter!(
+        "vllm_router_admission_rejected_total",
+        "Total number of requests the concurrency limiter rejected, by reason"
+    );
+    describe_histogram!(
+        ADMISSION_WAIT_SECONDS,
+        "Time in seconds a request spent in the concurrency limiter queue, for every outcome"
+    );
+
     // Running requests gauge for cache-aware policy
     describe_gauge!(
         "vllm_router_running_requests",
@@ -446,11 +462,20 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
+    let builder = set_admission_buckets(builder, &duration_bucket);
     builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+}
+
+/// The queue wait histogram does not match the `duration_seconds` suffix. Without
+/// its own buckets, the exporter renders it as a summary.
+fn set_admission_buckets(builder: PrometheusBuilder, buckets: &[f64]) -> PrometheusBuilder {
+    builder
+        .set_buckets_for_metric(Matcher::Full(ADMISSION_WAIT_SECONDS.to_string()), buckets)
+        .expect("failed to set admission wait bucket")
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -970,6 +995,23 @@ impl RouterMetrics {
         gauge!("vllm_router_embeddings_queue_size").set(size as f64);
     }
 
+    // Concurrency limiter admission metrics
+    pub fn increment_admission_waiting() {
+        gauge!("vllm_router_admission_waiting").increment(1.0);
+    }
+
+    pub fn decrement_admission_waiting() {
+        gauge!("vllm_router_admission_waiting").decrement(1.0);
+    }
+
+    pub fn record_admission_wait(duration: Duration) {
+        histogram!(ADMISSION_WAIT_SECONDS).record(duration.as_secs_f64());
+    }
+
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!("vllm_router_admission_rejected_total", "reason" => reason).increment(1);
+    }
+
     // Running requests for cache-aware policy
     pub fn set_running_requests(worker: &str, count: usize) {
         gauge!("vllm_router_running_requests",
@@ -1370,6 +1412,22 @@ mod tests {
             Matcher::Suffix(s) => assert_eq!(s, "duration_seconds"),
             _ => panic!("Expected Suffix matcher"),
         }
+    }
+
+    #[test]
+    fn test_admission_wait_renders_as_histogram() {
+        let recorder = set_admission_buckets(PrometheusBuilder::new(), &[1.0]).build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            RouterMetrics::record_admission_wait(Duration::from_millis(1));
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("vllm_router_admission_wait_seconds_bucket{le=\"1\"} 1"),
+            "{rendered}"
+        );
     }
 
     // ============= Upkeep Timeout Tests =============

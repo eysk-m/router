@@ -68,6 +68,28 @@ launcher; there are no corresponding Rust CLI flags.
 Admission tokens refill with elapsed time, so another request can be admitted
 while an earlier request is still running, even with `--max-concurrent-requests 1`.
 
+The limiter covers the inference routes and the unmatched paths that the router
+proxies to a worker, and they share one pool. Health, model information and
+admin routes are not limited.
+
+When the limiter rejects a request, the `x-vllm-router-admission-reason` response
+header gives the reason:
+
+| Reason | Status | Meaning |
+| --- | --- | --- |
+| `no_capacity` | `429` | No token is free and queuing is disabled. |
+| `queue_full` | `429` | No token is free and the queue has no room. |
+| `queue_timeout` | `408` | The request ran out of time in the queue. |
+| `closed` | `429` or `500` | The queue stopped. |
+
+The limiter exports these Prometheus metrics:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `vllm_router_admission_waiting` | Gauge | Requests in the queue now. |
+| `vllm_router_admission_rejected_total` | Counter | Rejections, with the reason above in the `reason` label. |
+| `vllm_router_admission_wait_seconds` | Histogram | Time in the queue for each request that entered it, for every outcome. |
+
 ## Workers and backend
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
