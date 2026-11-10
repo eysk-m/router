@@ -458,8 +458,13 @@ async fn serve_raw_connection(mut socket: TcpStream, mock: Mock) {
 
 // Self-tests: the mock sees the ends that the rig's assertions depend on.
 
+/// A client for the self-tests. Its timeout puts a limit on each of them.
 fn plain_client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(WAIT_DURATION)
+        .build()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -526,7 +531,11 @@ async fn raw_hang_up_gives_a_transport_error() {
         .json(&json!({}))
         .send()
         .await;
-    assert!(result.is_err(), "expected a transport error: {result:?}");
+    // The client's own timeout is not a hang-up.
+    assert!(
+        result.as_ref().is_err_and(|error| !error.is_timeout()),
+        "expected a transport error: {result:?}"
+    );
     mock.expect_completed().await;
     server.abort();
 }

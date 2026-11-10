@@ -109,6 +109,19 @@ impl EcRecorder {
             .collect()
     }
 
+    /// Rig assumption: the recorder thread is still running. A thread that
+    /// panicked logs nothing more, so without this check `expect_no_cancel`
+    /// could pass with a recorder that sees no traffic.
+    fn expect_running(&self) {
+        assert!(
+            self.thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished()),
+            "[rig assumption] the recorder thread stopped, so its log is not complete: {:?}",
+            self.seen
+        );
+    }
+
     /// `[EC cancel]`: after a `peers` query, every transfer in `ids` gets a
     /// cancel with `abandon: true`, and no other transfer does.
     pub async fn expect_cancel(&mut self, ids: &[String]) {
@@ -121,10 +134,13 @@ impl EcRecorder {
             }
             match tokio::time::timeout_at(deadline, self.log.recv()).await {
                 Ok(Some(message)) => self.seen.push(message),
-                _ => panic!(
-                    "[EC cancel] expected a cancel for each of {ids:?}, the control address got {:?}",
-                    self.seen
-                ),
+                _ => {
+                    self.expect_running();
+                    panic!(
+                        "[EC cancel] expected a cancel for each of {ids:?}, the control address got {:?}",
+                        self.seen
+                    )
+                }
             }
         }
         assert_eq!(
@@ -150,6 +166,7 @@ impl EcRecorder {
             "[EC cancel] expected no EC control traffic, got {:?}",
             self.seen
         );
+        self.expect_running();
     }
 }
 
@@ -294,10 +311,7 @@ impl Rig {
                 "max_tokens": 1,
                 "messages": [{"role": "user", "content": "warm up"}],
             });
-            let response = rig
-                .router
-                .route_transparent(None, CHAT_ROUTE, &Method::POST, warm_up.clone())
-                .await;
+            let response = answer(rig.send(warm_up.clone())).await;
             assert_eq!(response.status(), StatusCode::OK, "[client] warm-up");
             text(response).await;
             rig.expect_concurrent_path(warm_up).await;
