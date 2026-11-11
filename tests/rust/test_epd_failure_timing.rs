@@ -1,58 +1,6 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
 //! E/P/D failure, cancellation and cleanup ownership: timing tests.
-//!
-//! An E/P/D request moves through stages. Encoders produce embeddings, an EC
-//! transfer carries them to the consumer (Prefill, or the combined worker),
-//! and Decode produces the reply. `EcTransferGuard`
-//! (`src/routers/http/epd.rs`) is armed when the transfers start. While it is
-//! armed, a failure or a dropped request makes the router cancel the
-//! transfers. A handoff event disarms it; from then on the consumer owns the
-//! cleanup. These tests pin down what happens when a failure, a stall or a
-//! disconnect lands on either side of that event.
-//!
-//! Four timing cases:
-//!
-//! 1. an early encoder failure while a sibling encoder is still blocked;
-//! 2. a consumer that sends 2xx headers, then a stalled or invalid body;
-//! 3. a Decode disconnect, before the first byte or in the middle of SSE;
-//! 4. a client disconnect that races a handoff event.
-//!
-//! Each case runs on three paths. They disarm the guard at different handoff
-//! events:
-//!
-//! - `regular_e_pd`: at the combined worker's 2xx response headers
-//!   (`Router::route_transparent`);
-//! - `sequential_e_p_d`: after Prefill's whole body, its JSON parse and a KV
-//!   check (`VllmPDRouter::process_vllm_two_stage_request`);
-//! - `concurrent_nixl`: after a join of Prefill's whole body with Decode's
-//!   headers, and an optional parse (`process_concurrent_two_stage`).
-//!
-//! "The request ended" can mean five different things, and they do not always
-//! happen together: HTTP socket disconnect, local future or stream drop,
-//! encoder HTTP abort, EC control cancellation and GPU completion. Each
-//! assertion names the one it checks:
-//!
-//! - `[local drop]`: the test drops the router's request future or its
-//!   response body. Hyper does the same when a client socket closes; the
-//!   client socket itself is not part of these tests.
-//! - `[socket close]`: a Prefill, Decode or combined worker mock sees its open
-//!   request end early, because the router closed the connection.
-//! - `[encoder abort]`: the same, seen by an encoder mock.
-//! - `[EC cancel]`: the consumer's EC control address, a ZMQ REP recorder,
-//!   gets `peers` and then `cancel` with `abandon: true`.
-//! - GPU completion needs real engines; no test here sees it.
-//!
-//! Two more labels support them: `[client]` for what the caller of the router
-//! gets, and `[dispatch]` for which mocks got a request.
-//!
-//! The harness lives in `common/epd/`. Gates set the timing, not sleeps. Each
-//! mock signals a `Notify` when a request arrives, and holds its reply on a
-//! `Semaphore` until the test adds a permit. Only checks that something does
-//! *not* happen wait for a fixed time (`QUIET`): such a check can miss a late
-//! event, but it cannot fail while the behavior is as described.
-//!
-//! Run: `cargo test --features cpu,ready --test test_epd_failure_timing`.
 
 #[path = "common/epd/rig.rs"]
 mod epd;
@@ -63,11 +11,6 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 /// An early encoder failure while a sibling encoder is still blocked.
-///
-/// `EncoderStage::prepare` sends one request per encoder batch and waits for
-/// all of them with `join_all`. Only then does it return the first error, in
-/// batch order. The encoder stage runs before the sequential or concurrent
-/// branch, so the three paths behave the same.
 mod early_encoder_failure_with_blocked_sibling {
     use super::*;
     use axum::response::Response;

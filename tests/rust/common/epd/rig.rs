@@ -36,9 +36,7 @@ pub use mock::*;
 mod client;
 pub use client::*;
 
-/// The consumer's EC control address: a ZMQ REP socket on its own thread. It
-/// answers `peers` with its own port and anything else with `cancelled: true`,
-/// and logs every message for `expect_cancel` and `expect_no_cancel`.
+/// The consumer's EC control address: a ZMQ REP socket on its own thread.
 pub struct EcRecorder {
     address: String,
     log: mpsc::UnboundedReceiver<Value>,
@@ -48,8 +46,6 @@ pub struct EcRecorder {
 }
 
 impl EcRecorder {
-    /// Binds a free port and starts the thread. Returns once the address is
-    /// known.
     pub fn start() -> Self {
         let (address_tx, address_rx) = std::sync::mpsc::channel();
         let (log_tx, log) = mpsc::unbounded_channel();
