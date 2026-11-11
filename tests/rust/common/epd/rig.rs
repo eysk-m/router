@@ -194,6 +194,8 @@ pub enum Path {
 pub struct Options {
     /// Serve the last stage (PD, or D) with `serve_raw`, for `Mode::HangUp`.
     pub raw_last_stage: bool,
+    /// The router's HTTP client timeout, which `--request-timeout-secs` sets.
+    pub client_timeout: Option<Duration>,
 }
 
 /// A router with Mooncake-push EPD (a consumer EC control address, so prepare
@@ -286,7 +288,7 @@ impl Rig {
         ConfigValidator::validate(&config).expect("valid E/P/D config");
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(60))
+            .timeout(options.client_timeout.unwrap_or(Duration::from_secs(60)))
             .build()
             .unwrap();
         let context = Arc::new(AppContext::new(config, client, 64, None, vec![]).unwrap());
@@ -343,7 +345,7 @@ impl Rig {
 
     /// Rig assumption: a new router sends image 0 to E0 and image 1 to E1
     /// (round-robin per item in `EncoderStage::prepare`), so E0's comes first.
-    fn expect_encoder_assignment(&self) {
+    pub fn expect_encoder_assignment(&self) {
         for (mock, image) in [(&self.e0, "base64,AAAA"), (&self.e1, "base64,BBBB")] {
             let requests = mock.requests();
             assert!(
