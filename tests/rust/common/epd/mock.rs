@@ -9,6 +9,7 @@ use super::{CHAT_ROUTE, WAIT_DURATION};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -28,8 +29,12 @@ use super::http;
 pub enum Mode {
     /// The role's normal reply, at once.
     Reply,
+    /// This status and a JSON error, at once.
+    FailWithStatus(u16),
     /// Hold, then the normal reply.
     HoldThenReply,
+    /// Hold, then the failure.
+    HoldThenFailWithStatus(u16),
     /// The headers and the first byte of the body at once; hold the rest.
     StallBody,
     /// `StallBody`, but the body is not JSON.
@@ -350,6 +355,14 @@ fn prefill_reply(push: bool) -> Value {
     json!({"kv_transfer_params": kv})
 }
 
+fn failure(status: u16) -> Response {
+    (
+        StatusCode::from_u16(status).unwrap(),
+        Json(json!({"error": "injected failure"})),
+    )
+        .into_response()
+}
+
 /// The axum handler for `serve`: every mode but `HangUp`.
 async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Response {
     let life = mock.arrive(request.clone());
@@ -362,6 +375,13 @@ async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Respons
             }
             life.finish();
             ([(CONTENT_TYPE, content_type)], format!("{head}{rest}")).into_response()
+        }
+        Mode::FailWithStatus(status) | Mode::HoldThenFailWithStatus(status) => {
+            if mode == Mode::HoldThenFailWithStatus(status) {
+                mock.hold().await;
+            }
+            life.finish();
+            failure(status)
         }
         Mode::StallBody
         | Mode::StallBodyInvalidJson

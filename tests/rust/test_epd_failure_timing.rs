@@ -8,6 +8,7 @@ mod epd;
 use axum::http::StatusCode;
 use epd::*;
 use serde_json::Value;
+use std::time::{Duration, Instant};
 
 /// The EC consumer sends 2xx headers, then its body stalls or is invalid.
 mod consumer_2xx_with_stalled_or_invalid_body {
@@ -177,6 +178,7 @@ mod decode_disconnect {
     fn raw_last_stage() -> Options {
         Options {
             raw_last_stage: true,
+            ..Options::default()
         }
     }
 
@@ -392,5 +394,132 @@ mod client_drop_races_the_handoff {
             rig.decode.expect_aborted().await;
             rig.expect_no_cancel().await;
         }
+    }
+}
+
+/// An early encoder failure while a sibling encoder is still blocked.
+mod early_encoder_failure_with_blocked_sibling {
+    use super::*;
+    use axum::response::Response;
+    use tokio::task::JoinHandle;
+
+    /// Sends a request where E0 fails at once with 503 and E1 holds its
+    /// reply. Returns when E0 has answered and E1 has the request.
+    async fn e0_failed_e1_blocked(path: Path) -> (Rig, JoinHandle<Response>) {
+        let rig = Rig::new(path).await;
+        rig.e0.set_mode(Mode::FailWithStatus(503));
+        rig.e1.set_mode(Mode::HoldThenReply);
+        let client = rig.send(two_images(false));
+        rig.e0.expect_completed().await;
+        rig.e1.wait_requests(1).await;
+        rig.expect_encoder_assignment();
+        (rig, client)
+    }
+
+    /// E0 fails at once; E1 is blocked and answers in the end.
+    async fn sibling_answers_late(path: Path) {
+        let (mut rig, mut client) = e0_failed_e1_blocked(path).await;
+        // gap: the failure is known, but join_all keeps the request open and
+        // E1 working. A sibling abort (try_join_all) would end both here.
+        expect_waiting(&mut client).await;
+        rig.e1.expect_open();
+        // gap: the armed guard lives in prepare, so the cancel waits for E1.
+        rig.expect_no_cancel().await;
+        rig.e1.release();
+        let response = answer(client).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "[client] E0's error"
+        );
+        rig.e1.expect_completed().await;
+        rig.expect_cancel().await;
+        rig.consumer.expect_no_request();
+        rig.decode.expect_no_request();
+    }
+
+    /// E0 fails at once; the client goes away while E1 is still blocked.
+    async fn client_leaves_while_sibling_blocked(path: Path) {
+        let (mut rig, mut client) = e0_failed_e1_blocked(path).await;
+        expect_waiting(&mut client).await;
+        disconnect(client).await;
+        // The drop reaches join_all: E1's connection closes, and the armed
+        // guard cancels both transfers.
+        rig.e1.expect_aborted().await;
+        rig.expect_cancel().await;
+        rig.consumer.expect_no_request();
+        rig.decode.expect_no_request();
+    }
+
+    #[tokio::test]
+    async fn regular_e_pd() {
+        sibling_answers_late(Path::CombinedPd).await;
+        client_leaves_while_sibling_blocked(Path::CombinedPd).await;
+    }
+
+    #[tokio::test]
+    async fn sequential_e_p_d() {
+        sibling_answers_late(Path::SplitPdSequential).await;
+        client_leaves_while_sibling_blocked(Path::SplitPdSequential).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_nixl() {
+        sibling_answers_late(Path::SplitPdConcurrent).await;
+        client_leaves_while_sibling_blocked(Path::SplitPdConcurrent).await;
+    }
+
+    /// Only the router's HTTP client timeout bounds that wait.
+    #[tokio::test]
+    async fn blocked_sibling_holds_the_request_until_the_client_timeout() {
+        let timeout = Duration::from_secs(1);
+        let options = Options {
+            client_timeout: Some(timeout),
+            ..Options::default()
+        };
+        let mut rig = Rig::with(Path::CombinedPd, options).await;
+        rig.e0.set_mode(Mode::FailWithStatus(503));
+        rig.e1.set_mode(Mode::HoldThenReply); // never released
+        let started = Instant::now();
+        let response = answer(rig.send(two_images(false))).await;
+        // gap: with the default timeout, this answer takes 30 minutes.
+        assert!(
+            started.elapsed() >= timeout,
+            "[client] answered after {:?}, before the client timeout",
+            started.elapsed()
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "[client] E0's error, not E1's timeout"
+        );
+        // The timeout, not the failure, ended E1's request.
+        rig.e1.expect_aborted().await;
+        rig.expect_cancel().await;
+        rig.consumer.expect_no_request();
+    }
+
+    /// `prepare` returns the first error in batch order, not the first in
+    /// time. A sibling abort would return E1's error instead, so this test
+    /// changes with that patch.
+    #[tokio::test]
+    async fn first_error_in_batch_order_wins() {
+        let mut rig = Rig::new(Path::CombinedPd).await;
+        rig.e0.set_mode(Mode::HoldThenFailWithStatus(500));
+        rig.e1.set_mode(Mode::FailWithStatus(503));
+        let mut client = rig.send(two_images(false));
+        rig.e1.expect_completed().await;
+        rig.e0.wait_requests(1).await;
+        rig.expect_encoder_assignment();
+        expect_waiting(&mut client).await;
+        rig.e0.release();
+        let response = answer(client).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "[client] E0's 500 (batch 0), not E1's earlier 503"
+        );
+        rig.expect_cancel().await;
+        rig.consumer.expect_no_request();
     }
 }
